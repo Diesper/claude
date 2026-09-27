@@ -1,0 +1,217 @@
+name: MangaTranslator CI
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ── Gate 0: versão única e metadados sincronizados ─────────────────────────
+  version-integrity:
+    name: Version Integrity
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+
+      - name: Verificar fonte única de versão
+        run: npm run version:check
+
+  # ── Job 1: Verificação de Sintaxe dos Arquivos JS ──────────────────────────
+  syntax-check:
+    name: JS Syntax Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+
+      - name: Verificar sintaxe de todos os arquivos JS da extensão
+        run: |
+          echo "Verificando sintaxe dos arquivos da extensão..."
+          node --check scripts/sync-version.js
+          find extension -name "*.js" -type f | sort | while read f; do
+            node --check "$f" && echo "✅ $f" || (echo "❌ $f" && exit 1)
+          done
+
+      - name: Verificar sintaxe dos arquivos de teste
+        run: |
+          echo "Verificando sintaxe dos testes..."
+          find tests -name "*.test.js" -o -name "*.spec.js" -o -name "smoke-*.js" | while read f; do
+            node --check "$f" && echo "✅ $f" || (echo "❌ $f" && exit 1)
+          done
+
+  # ── Job 2: Validação do manifest.json ────────────────────────────────────────
+  manifest-validation:
+    name: Manifest Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Validar manifest.json
+        run: |
+          node -e "
+            const fs = require('fs');
+            const manifest = JSON.parse(fs.readFileSync('extension/manifest.json', 'utf8'));
+            const required = ['manifest_version', 'name', 'version', 'permissions'];
+            required.forEach(field => {
+              if (!manifest[field]) { console.error('Falta campo: ' + field); process.exit(1); }
+            });
+            if (manifest.manifest_version !== 3) {
+              console.error('manifest_version deve ser 3'); process.exit(1);
+            }
+            console.log('✅ manifest.json válido:', manifest.name, 'v' + manifest.version);
+          "
+
+  # ── Job 3: Testes de Unidade, Fumaça e Visuais ──────────────────────────────
+  unit-and-integration:
+    name: Smoke + Visual + Unit Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20.x, 22.x]
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: tests/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Criar imagens de teste
+        run: npm run test:images
+
+      - name: Rodar Testes de Fumaça
+        run: npm run test:smoke
+
+      - name: Rodar Testes Visuais Perceptuais (v3 e v4)
+        run: npm run test:visual-v3
+
+      - name: Rodar Testes Jest Unitários e de Integração
+        run: npm run test:ci
+
+  # ── Job 4: Cobertura de Código ───────────────────────────────────────────────
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    needs: unit-and-integration
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: tests
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+          cache-dependency-path: tests/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Criar imagens de teste
+        run: npm run test:images
+
+      - name: Gerar relatório de cobertura
+        run: npm run test:coverage || true
+
+      - name: Upload cobertura para Codecov
+        uses: codecov/codecov-action@v4
+        continue-on-error: true
+        with:
+          files: ./tests/coverage/lcov.info
+          flags: unittests
+          name: manga-translator-coverage
+          fail_ci_if_error: false
+
+      - name: Salvar relatório HTML de cobertura
+        uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: coverage-report-${{ github.sha }}
+          path: tests/coverage/
+          retention-days: 30
+
+  # ── Job 5: E2E Tests ─────────────────────────────────────────────────────────
+  e2e:
+    name: E2E Tests (Playwright)
+    runs-on: ubuntu-latest
+    needs: unit-and-integration
+    defaults:
+      run:
+        working-directory: tests
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+          cache-dependency-path: tests/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Instalar Playwright e browsers
+        run: npx playwright install chromium --with-deps
+
+      - name: Criar imagens de teste
+        run: npm run test:images
+
+      - name: Iniciar servidor mock (background)
+        run: npm run mock:server &
+        env:
+          CI: true
+
+      - name: Aguardar servidor mock
+        run: npx wait-on http://localhost:3999/health --timeout 15000
+
+      - name: Rodar testes E2E
+        run: xvfb-run --auto-servernum -- npm run test:e2e
+        env:
+          CI: true
+
+      - name: Upload screenshots de falha
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-screenshots-${{ github.sha }}
+          path: tests/test-results/
+          retention-days: 7
